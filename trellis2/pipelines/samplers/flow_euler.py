@@ -90,11 +90,12 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        callback_on_step_end: Optional[Callable] = None,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -103,6 +104,8 @@ class FlowEulerSampler(Sampler):
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            callback_on_step_end: Optional callback invoked after each step.
+                Signature: callback(step, total_steps, timestep, sample, pred_x_0)
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -117,11 +120,21 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+        for step_idx, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
+
+            # Invoke callback after each step
+            if callback_on_step_end is not None:
+                callback_on_step_end(
+                    step=step_idx,
+                    total_steps=steps,
+                    timestep=t,
+                    sample=sample,
+                    pred_x_0=out.pred_x_0,
+                )
         ret.samples = sample
         return ret
 
@@ -141,11 +154,12 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
         rescale_t: float = 1.0,
         guidance_strength: float = 3.0,
         verbose: bool = True,
+        callback_on_step_end: Optional[Callable] = None,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -155,6 +169,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             rescale_t: The rescale factor for t.
             guidance_strength: The strength of classifier-free guidance.
             verbose: If True, show a progress bar.
+            callback_on_step_end: Optional callback invoked after each step.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -163,7 +178,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, verbose, callback_on_step_end=callback_on_step_end, neg_cond=neg_cond, guidance_strength=guidance_strength, **kwargs)
 
 
 class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
@@ -182,11 +197,12 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
         guidance_strength: float = 3.0,
         guidance_interval: Tuple[float, float] = (0.0, 1.0),
         verbose: bool = True,
+        callback_on_step_end: Optional[Callable] = None,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -197,6 +213,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             guidance_strength: The strength of classifier-free guidance.
             guidance_interval: The interval for classifier-free guidance.
             verbose: If True, show a progress bar.
+            callback_on_step_end: Optional callback invoked after each step.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -205,4 +222,4 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, verbose, callback_on_step_end=callback_on_step_end, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)

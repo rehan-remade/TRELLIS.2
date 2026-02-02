@@ -191,24 +191,48 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
+        callback_on_step_end: Optional[Callable] = None,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             resolution (int): The resolution of the sparse structure.
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
+            callback_on_step_end: Optional callback invoked after each diffusion step.
         """
         # Sample sparse structure latent
         flow_model = self.models['sparse_structure_flow_model']
+        decoder = self.models['sparse_structure_decoder']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
         noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
+            decoder.to(self.device)
+
+        # Wrap callback to decode latent and extract voxel coords
+        wrapped_callback = None
+        if callback_on_step_end is not None:
+            def wrapped_callback(step, total_steps, timestep, sample, pred_x_0):
+                # Decode pred_x_0 to get preview voxels
+                with torch.no_grad():
+                    decoded_preview = decoder(pred_x_0)
+                # Progressive threshold for "crystallizing" effect
+                progress = step / max(total_steps - 1, 1) if total_steps > 1 else 1.0
+                threshold = -0.5 + progress * 0.8
+                coords_preview = torch.argwhere(decoded_preview > threshold)[:, [0, 2, 3, 4]].int()
+                callback_on_step_end(
+                    stage="sparse_structure",
+                    step=step,
+                    total_steps=total_steps,
+                    coords=coords_preview,
+                    latent=pred_x_0,
+                )
+
         z_s = self.sparse_structure_sampler.sample(
             flow_model,
             noise,
@@ -216,13 +240,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             **sampler_params,
             verbose=True,
             tqdm_desc="Sampling sparse structure",
+            callback_on_step_end=wrapped_callback,
         ).samples
         if self.low_vram:
             flow_model.cpu()
-        
+
         # Decode sparse structure latent
-        decoder = self.models['sparse_structure_decoder']
-        if self.low_vram:
+        if not self.low_vram:
             decoder.to(self.device)
         decoded = decoder(z_s)>0
         if self.low_vram:
@@ -240,14 +264,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         flow_model,
         coords: torch.Tensor,
         sampler_params: dict = {},
+        callback_on_step_end: Optional[Callable] = None,
     ) -> SparseTensor:
         """
         Sample structured latent with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             coords (torch.Tensor): The coordinates of the sparse structure.
             sampler_params (dict): Additional parameters for the sampler.
+            callback_on_step_end: Optional callback invoked after each diffusion step.
         """
         # Sample structured latent
         noise = SparseTensor(
@@ -257,6 +283,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
+
+        # Wrap callback to provide shape stage info
+        wrapped_callback = None
+        if callback_on_step_end is not None:
+            def wrapped_callback(step, total_steps, timestep, sample, pred_x_0):
+                callback_on_step_end(
+                    stage="shape",
+                    step=step,
+                    total_steps=total_steps,
+                    coords=coords,
+                    shape_slat=pred_x_0,
+                )
+
         slat = self.shape_slat_sampler.sample(
             flow_model,
             noise,
@@ -264,6 +303,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             **sampler_params,
             verbose=True,
             tqdm_desc="Sampling shape SLat",
+            callback_on_step_end=wrapped_callback,
         ).samples
         if self.low_vram:
             flow_model.cpu()
@@ -271,7 +311,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         return slat
     
     def sample_shape_slat_cascade(
@@ -285,15 +325,30 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         coords: torch.Tensor,
         sampler_params: dict = {},
         max_num_tokens: int = 49152,
+        callback_on_step_end: Optional[Callable] = None,
     ) -> SparseTensor:
         """
         Sample structured latent with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             coords (torch.Tensor): The coordinates of the sparse structure.
             sampler_params (dict): Additional parameters for the sampler.
+            callback_on_step_end: Optional callback invoked after each diffusion step.
         """
+        # LR pass callback (first half of shape stage)
+        lr_wrapped_callback = None
+        if callback_on_step_end is not None:
+            def lr_wrapped_callback(step, total_steps, timestep, sample, pred_x_0):
+                # Scale step to be in first half of shape stage
+                callback_on_step_end(
+                    stage="shape_lr",
+                    step=step,
+                    total_steps=total_steps,
+                    coords=coords,
+                    shape_slat=pred_x_0,
+                )
+
         # LR
         noise = SparseTensor(
             feats=torch.randn(coords.shape[0], flow_model_lr.in_channels).to(self.device),
@@ -308,14 +363,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             **lr_cond,
             **sampler_params,
             verbose=True,
-            tqdm_desc="Sampling shape SLat",
+            tqdm_desc="Sampling shape SLat (LR)",
+            callback_on_step_end=lr_wrapped_callback,
         ).samples
         if self.low_vram:
             flow_model_lr.cpu()
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         # Upsample
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
@@ -337,7 +393,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                     print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
                 break
             hr_resolution -= 128
-        
+
+        # HR pass callback (second half of shape stage)
+        hr_wrapped_callback = None
+        if callback_on_step_end is not None:
+            def hr_wrapped_callback(step, total_steps, timestep, sample, pred_x_0):
+                callback_on_step_end(
+                    stage="shape_hr",
+                    step=step,
+                    total_steps=total_steps,
+                    coords=coords,
+                    shape_slat=pred_x_0,
+                )
+
         # Sample structured latent
         noise = SparseTensor(
             feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
@@ -352,7 +420,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             **cond,
             **sampler_params,
             verbose=True,
-            tqdm_desc="Sampling shape SLat",
+            tqdm_desc="Sampling shape SLat (HR)",
+            callback_on_step_end=hr_wrapped_callback,
         ).samples
         if self.low_vram:
             flow_model.cpu()
@@ -360,7 +429,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         return slat, hr_resolution
 
     def decode_shape_slat(
@@ -394,33 +463,60 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         flow_model,
         shape_slat: SparseTensor,
         sampler_params: dict = {},
+        callback_on_step_end: Optional[Callable] = None,
     ) -> SparseTensor:
         """
         Sample structured latent with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             shape_slat (SparseTensor): The structured latent for shape
             sampler_params (dict): Additional parameters for the sampler.
+            callback_on_step_end: Optional callback invoked after each diffusion step.
         """
         # Sample structured latent
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
-        shape_slat = (shape_slat - mean) / std
+        shape_slat_normalized = (shape_slat - mean) / std
 
         in_channels = flow_model.in_channels if isinstance(flow_model, nn.Module) else flow_model[0].in_channels
-        noise = shape_slat.replace(feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device))
+        noise = shape_slat_normalized.replace(feats=torch.randn(shape_slat_normalized.coords.shape[0], in_channels - shape_slat_normalized.feats.shape[1]).to(self.device))
         sampler_params = {**self.tex_slat_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
+
+        # Wrap callback to provide texture stage info with PBR preview
+        wrapped_callback = None
+        if callback_on_step_end is not None:
+            tex_std = torch.tensor(self.tex_slat_normalization['std'])[None].to(self.device)
+            tex_mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(self.device)
+
+            def wrapped_callback(step, total_steps, timestep, sample, pred_x_0):
+                # Denormalize texture latent for preview
+                tex_preview = pred_x_0 * tex_std + tex_mean
+                # Extract base color approximation (first 3 channels typically correspond to color)
+                pbr_attrs = None
+                if hasattr(tex_preview, 'feats') and tex_preview.feats.shape[1] >= 3:
+                    base_color = (tex_preview.feats[:, :3] * 0.5 + 0.5).clamp(0, 1)
+                    pbr_attrs = {'base_color': base_color}
+                callback_on_step_end(
+                    stage="texture",
+                    step=step,
+                    total_steps=total_steps,
+                    coords=shape_slat.coords,
+                    tex_slat=pred_x_0,
+                    pbr_attrs=pbr_attrs,
+                )
+
         slat = self.tex_slat_sampler.sample(
             flow_model,
             noise,
-            concat_cond=shape_slat,
+            concat_cond=shape_slat_normalized,
             **cond,
             **sampler_params,
             verbose=True,
             tqdm_desc="Sampling texture SLat",
+            callback_on_step_end=wrapped_callback,
         ).samples
         if self.low_vram:
             flow_model.cpu()
@@ -428,7 +524,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         return slat
 
     def decode_tex_slat(
@@ -593,3 +689,132 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return out_mesh, (shape_slat, tex_slat, res)
         else:
             return out_mesh
+
+    @torch.no_grad()
+    def run_with_callbacks(
+        self,
+        image: Image.Image,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+        sparse_structure_callback: Optional[Callable] = None,
+        shape_callback: Optional[Callable] = None,
+        texture_callback: Optional[Callable] = None,
+        decode_callback: Optional[Callable] = None,
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline with streaming callbacks for real-time visualization.
+
+        Args:
+            image (Image.Image): The image prompt.
+            num_samples (int): The number of samples to generate.
+            seed (int): The random seed.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            shape_slat_sampler_params (dict): Additional parameters for the shape SLat sampler.
+            tex_slat_sampler_params (dict): Additional parameters for the texture SLat sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+            pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
+            max_num_tokens (int): The maximum number of tokens to use.
+            sparse_structure_callback: Callback for sparse structure diffusion stage.
+                Signature: callback(stage, step, total_steps, coords, latent)
+            shape_callback: Callback for shape latent diffusion stage.
+                Signature: callback(stage, step, total_steps, coords, shape_slat)
+            texture_callback: Callback for texture latent diffusion stage.
+                Signature: callback(stage, step, total_steps, coords, tex_slat, pbr_attrs)
+            decode_callback: Callback for mesh decoding.
+                Signature: callback(stage, vertices, faces, pbr_attrs)
+        """
+        # Check pipeline type
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '512':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
+        elif pipeline_type == '1024':
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        elif pipeline_type == '1024_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        elif pipeline_type == '1536_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        else:
+            raise ValueError(f"Invalid pipeline type: {pipeline_type}")
+
+        if preprocess_image:
+            image = self.preprocess_image(image)
+        torch.manual_seed(seed)
+        cond_512 = self.get_cond([image], 512)
+        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+
+        # Stage 1: Sparse structure
+        coords = self.sample_sparse_structure(
+            cond_512, ss_res,
+            num_samples, sparse_structure_sampler_params,
+            callback_on_step_end=sparse_structure_callback
+        )
+
+        # Stage 2: Shape latent
+        if pipeline_type == '512':
+            shape_slat = self.sample_shape_slat(
+                cond_512, self.models['shape_slat_flow_model_512'],
+                coords, shape_slat_sampler_params,
+                callback_on_step_end=shape_callback
+            )
+            res = 512
+        elif pipeline_type == '1024':
+            shape_slat = self.sample_shape_slat(
+                cond_1024, self.models['shape_slat_flow_model_1024'],
+                coords, shape_slat_sampler_params,
+                callback_on_step_end=shape_callback
+            )
+            res = 1024
+        elif pipeline_type in ('1024_cascade', '1536_cascade'):
+            target_res = 1024 if pipeline_type == '1024_cascade' else 1536
+            shape_slat, res = self.sample_shape_slat_cascade(
+                cond_512, cond_1024,
+                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                512, target_res,
+                coords, shape_slat_sampler_params,
+                max_num_tokens,
+                callback_on_step_end=shape_callback
+            )
+
+        # Stage 3: Texture latent
+        tex_flow_model = self.models['tex_slat_flow_model_512'] if pipeline_type == '512' else self.models['tex_slat_flow_model_1024']
+        tex_cond = cond_512 if pipeline_type == '512' else cond_1024
+        tex_slat = self.sample_tex_slat(
+            tex_cond, tex_flow_model,
+            shape_slat, tex_slat_sampler_params,
+            callback_on_step_end=texture_callback
+        )
+
+        torch.cuda.empty_cache()
+
+        # Decode mesh
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+
+        # Call decode callback with mesh data
+        if decode_callback is not None and len(out_mesh) > 0:
+            mesh = out_mesh[0]
+            decode_callback(
+                stage="mesh_ready",
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                pbr_attrs={
+                    'base_color': mesh.attrs[:, self.pbr_attr_layout['base_color']] if mesh.attrs is not None else None,
+                    'metallic': mesh.attrs[:, self.pbr_attr_layout['metallic']] if mesh.attrs is not None else None,
+                    'roughness': mesh.attrs[:, self.pbr_attr_layout['roughness']] if mesh.attrs is not None else None,
+                    'alpha': mesh.attrs[:, self.pbr_attr_layout['alpha']] if mesh.attrs is not None else None,
+                } if mesh.attrs is not None else None,
+            )
+
+        return out_mesh
