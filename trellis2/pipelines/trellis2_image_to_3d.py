@@ -554,6 +554,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         shape_slat: SparseTensor,
         tex_slat: SparseTensor,
         resolution: int,
+        progress_callback: Optional[Callable] = None,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -562,9 +563,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             shape_slat (SparseTensor): The structured latent for shape.
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
+            progress_callback: Optional callback for decode progress.
+                Signature: callback(stage, progress_pct, message)
         """
+        if progress_callback:
+            progress_callback("decode_shape", 0, "Decoding shape latent...")
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+
+        if progress_callback:
+            progress_callback("decode_texture", 50, "Decoding texture latent...")
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
+
+        if progress_callback:
+            progress_callback("build_mesh", 80, "Building mesh...")
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
             m.fill_holes()
@@ -579,6 +590,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                     layout=self.pbr_attr_layout
                 )
             )
+        if progress_callback:
+            progress_callback("decode_done", 100, "Mesh decoded!")
         return out_mesh
     
     @torch.no_grad()
@@ -799,8 +812,27 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         torch.cuda.empty_cache()
 
+        # Signal that decoding is starting
+        if decode_callback is not None:
+            decode_callback(
+                stage="decode_start",
+                vertices=None,
+                faces=None,
+                pbr_attrs=None,
+            )
+
+        # Create decode progress callback wrapper
+        def decode_progress_callback(stage, pct, message):
+            if decode_callback is not None:
+                decode_callback(
+                    stage=f"decode_progress_{stage}",
+                    vertices=None,
+                    faces=None,
+                    pbr_attrs={"progress": pct, "message": message},
+                )
+
         # Decode mesh
-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res, progress_callback=decode_progress_callback)
 
         # Call decode callback with mesh data
         if decode_callback is not None and len(out_mesh) > 0:
