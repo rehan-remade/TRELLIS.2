@@ -7,9 +7,26 @@ from PIL import Image
 
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        # Temporarily set default device to CPU to avoid meta tensor issues
+        # with briaai/RMBG-2.0 model initialization
+        original_device = None
+        try:
+            original_device = torch.get_default_device()
+        except:
+            pass
+
+        torch.set_default_device('cpu')
+        try:
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+        finally:
+            # Restore original device setting
+            if original_device is not None:
+                torch.set_default_device(original_device)
+            else:
+                torch.set_default_device(None)
+
         self.model.eval()
         self.transform_image = transforms.Compose(
             [
